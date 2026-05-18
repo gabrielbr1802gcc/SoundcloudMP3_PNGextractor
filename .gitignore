@@ -1,0 +1,18 @@
+# Code::Blocks build outputs
+/bin/
+/obj/
+
+# Code::Blocks user/layout files
+*.layout
+*.depend
+
+# Windows cruft
+Thumbs.db
+Desktop.ini
+
+# Optional local artifacts
+*.jpg
+*.png
+*.webp
+*.gif
+*.bmp
