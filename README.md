@@ -15,19 +15,19 @@ Run the program, paste the MP3 path, and press Enter. Then either type an output
 Extract cover next to the MP3:
 
 ```bash
-thumb_extrac "C:\\Musicas\\teste.mp3"
+thumb_extrac "C:\\Musics\\teste.mp3"
 ```
 
 Extract cover into a folder:
 
 ```bash
-thumb_extrac "C:\\Musicas\\teste.mp3" "D:\\Capas\\"
+thumb_extrac "C:\\Musics\\teste.mp3" "D:\\Capas\\"
 ```
 
 Debug mode (prints tag/frame details):
 
 ```bash
-thumb_extrac --debug "C:\\Musicas\\teste.mp3"
+thumb_extrac --debug "C:\\Musics\\teste.mp3"
 ```
 
 Notes: paths with spaces are fine (use quotes). If you paste a path that already includes quotes, the program will handle it.
