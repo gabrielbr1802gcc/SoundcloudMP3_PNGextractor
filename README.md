@@ -1,6 +1,8 @@
-# thumb_extrac
+# SoundcloudMP3_PNGextractor
 
-Extrai a capa (thumbnail) embutida em um arquivo MP3 via ID3v2 (suporta ID3v2.2 PIC e ID3v2.3/2.4 APIC), sem dependências externas.
+Extrai a capa (thumbnail) embutida em um arquivo MP3 via ID3v2 (suporta ID3v2.2 `PIC` e ID3v2.3/2.4 `APIC`), sem dependências externas.
+
+Motivação: alguns MP3 baixados (ex.: SoundCloud/downloaders) têm a capa “escondida” dentro da tag e o Windows/Android nem sempre mostra fácil.
 
 ## Como usar
 
