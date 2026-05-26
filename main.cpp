@@ -1,9 +1,22 @@
-
 #include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
+#include <filesystem>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
+
+namespace fs = std::filesystem;
+
+#ifdef _WIN32
+using NativeString = std::wstring;
+#else
+using NativeString = std::string;
+#endif
 
 static uint32_t readU32BE(const uint8_t *p)
 {
@@ -32,22 +45,60 @@ static std::vector<uint8_t> unsyncDecode(const std::vector<uint8_t> &in)
     return out;
 }
 
-static std::string trimSpaces(const std::string &s)
+static NativeString trimSpacesNative(const NativeString &s)
 {
     size_t a = 0;
     while (a < s.size() && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n')) ++a;
+
     size_t b = s.size();
     while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n')) --b;
+
     return s.substr(a, b - a);
 }
 
-static std::string stripOuterQuotes(const std::string &s)
+static fs::path cleanPath(const NativeString &raw)
 {
-    std::string t = trimSpaces(s);
-    if (t.size() >= 2 && ((t.front() == '"' && t.back() == '"') || (t.front() == '\'' && t.back() == '\''))) {
-        t = t.substr(1, t.size() - 2);
+    NativeString t = trimSpacesNative(raw);
+
+    if (t.size() >= 2) {
+        const auto first = t.front();
+        const auto last = t.back();
+
+        if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
+            t = t.substr(1, t.size() - 2);
+        }
     }
-    return trimSpaces(t);
+
+    return fs::path(trimSpacesNative(t));
+}
+
+static NativeString asciiToNative(const std::string &s)
+{
+#ifdef _WIN32
+    return NativeString(s.begin(), s.end());
+#else
+    return s;
+#endif
+}
+
+static bool pathEndsWithSlash(const fs::path &p)
+{
+    const auto s = p.native();
+    if (s.empty()) return false;
+
+    const auto c = s.back();
+    return c == '/' || c == '\\';
+}
+
+static fs::path appendAsciiToPath(const fs::path &base, const std::string &suffix)
+{
+    return fs::path(base.native() + asciiToNative(suffix));
+}
+
+static fs::path makeCoverPath(const fs::path &folder, const fs::path &mp3Path, const std::string &ext)
+{
+    fs::path filename = appendAsciiToPath(mp3Path.stem(), "_cover" + ext);
+    return folder / filename;
 }
 
 static std::string hexPrefix(const std::vector<uint8_t> &v, size_t n)
@@ -124,53 +175,8 @@ static std::string extFromMimeOrFmt(const std::string &mimeOrFmt)
     return ".bin";
 }
 
-static bool hasDot(const std::string &s)
+static int extractCoverFromMp3(const fs::path &mp3Path, const fs::path &outArg, bool debug)
 {
-    for (char c : s) {
-        if (c == '.') return true;
-        if (c == '/' || c == '\\') return false;
-    }
-    return false;
-}
-
-static bool endsWithSlash(const std::string &s)
-{
-    if (s.empty()) return false;
-    const char c = s.back();
-    return c == '/' || c == '\\';
-}
-
-static void splitDirFile(const std::string &path, std::string &dirOut, std::string &fileOut)
-{
-    const size_t p1 = path.find_last_of('/');
-    const size_t p2 = path.find_last_of('\\');
-    size_t p = std::string::npos;
-    if (p1 != std::string::npos && p2 != std::string::npos) p = (p1 > p2) ? p1 : p2;
-    else if (p1 != std::string::npos) p = p1;
-    else p = p2;
-
-    if (p == std::string::npos) {
-        dirOut.clear();
-        fileOut = path;
-        return;
-    }
-
-    dirOut = path.substr(0, p + 1);
-    fileOut = path.substr(p + 1);
-}
-
-static std::string stripExtension(const std::string &filename)
-{
-    const size_t dot = filename.find_last_of('.');
-    if (dot == std::string::npos) return filename;
-    return filename.substr(0, dot);
-}
-
-static int extractCoverFromMp3(const std::string &mp3PathRaw, const std::string &outArgRaw, bool debug)
-{
-    const std::string mp3Path = stripOuterQuotes(mp3PathRaw);
-    const std::string outArg = stripOuterQuotes(outArgRaw);
-
     std::ifstream in(mp3Path, std::ios::binary);
     if (!in) {
         std::cout << "Nao foi possivel abrir o arquivo\n";
@@ -223,7 +229,6 @@ static int extractCoverFromMp3(const std::string &mp3PathRaw, const std::string 
         } else if (verMajor == 4) {
             extSizeField = readSynchSafe32(&tag[pos]);
         } else {
-            // v2.2 e outros: nao suportado aqui
             std::cout << "Versao ID3v2 nao suportada: 2." << int(verMajor) << "\n";
             return 1;
         }
@@ -233,9 +238,6 @@ static int extractCoverFromMp3(const std::string &mp3PathRaw, const std::string 
             return 1;
         }
 
-        // Ambiguidade comum: alguns arquivos tratam o size como incluindo os 4 bytes;
-        // outros como excluindo. Tentamos os 2 jeitos e escolhemos o que parece
-        // alinhar no comeco de um frame valido.
         const size_t candA = pos + size_t(extSizeField);
         const size_t candB = pos + size_t(extSizeField) + 4;
 
@@ -259,45 +261,45 @@ static int extractCoverFromMp3(const std::string &mp3PathRaw, const std::string 
         pos = chosen;
     }
 
-    std::string mp3Dir, mp3File;
-    splitDirFile(mp3Path, mp3Dir, mp3File);
-    const std::string baseName = stripExtension(mp3File);
-
-    auto buildOutName = [&](const std::string &mimeOrFmt) -> std::string {
+    auto buildOutName = [&](const std::string &mimeOrFmt) -> fs::path {
         const std::string ext = extFromMimeOrFmt(mimeOrFmt);
+
         if (outArg.empty()) {
-            // Padrao: salva ao lado do mp3 e com nome unico
-            return mp3Dir + baseName + "_cover" + ext;
+            return makeCoverPath(mp3Path.parent_path(), mp3Path, ext);
         }
 
-        // Se o usuario passou uma pasta terminando com / ou \, salva dentro dela.
-        if (endsWithSlash(outArg)) {
-            return outArg + baseName + "_cover" + ext;
+        // Se existe e e pasta, salva dentro dela.
+        if (fs::exists(outArg) && fs::is_directory(outArg)) {
+            return makeCoverPath(outArg, mp3Path, ext);
         }
 
-        // Se tem ponto, tratamos como caminho completo de arquivo.
-        if (hasDot(outArg)) {
+        // Se terminou com / ou \, tambem trata como pasta.
+        if (pathEndsWithSlash(outArg)) {
+            return makeCoverPath(outArg, mp3Path, ext);
+        }
+
+        // Se tem extensao, trata como arquivo completo.
+        if (outArg.has_extension()) {
             return outArg;
         }
 
-        // Caso contrario, e um "nome base" (sem extensao)
-        return outArg + ext;
+        // Caso contrario, trata como nome base.
+        return appendAsciiToPath(outArg, ext);
     };
 
     auto writeCover = [&](const std::vector<uint8_t> &img, const std::string &mimeOrFmt) -> int {
         // Se o MIME/format estiver estranho, tenta detectar pelo "magic" real.
-        std::string outName = buildOutName(mimeOrFmt);
+        fs::path outName = buildOutName(mimeOrFmt);
         const std::string magicExt = detectExtFromMagic(img);
-        if (!magicExt.empty() && hasDot(outName)) {
-            // Se o usuario escolheu a extensao manualmente, nao mexe.
-        } else if (!magicExt.empty()) {
-            // Ajusta a extensao padrao baseada no magic quando nao foi especificada uma extensao.
+
+        // So ajusta a extensao automaticamente se o usuario nao passou um arquivo com extensao.
+        if (!magicExt.empty() && !outArg.has_extension()) {
             if (outArg.empty()) {
-                outName = mp3Dir + baseName + "_cover" + magicExt;
-            } else if (endsWithSlash(outArg)) {
-                outName = outArg + baseName + "_cover" + magicExt;
-            } else if (!hasDot(outArg)) {
-                outName = outArg + magicExt;
+                outName = makeCoverPath(mp3Path.parent_path(), mp3Path, magicExt);
+            } else if ((fs::exists(outArg) && fs::is_directory(outArg)) || pathEndsWithSlash(outArg)) {
+                outName = makeCoverPath(outArg, mp3Path, magicExt);
+            } else {
+                outName = appendAsciiToPath(outArg, magicExt);
             }
         }
 
@@ -310,7 +312,7 @@ static int extractCoverFromMp3(const std::string &mp3PathRaw, const std::string 
         out.write(reinterpret_cast<const char *>(img.data()), img.size());
         out.close();
 
-        std::cout << "Capa salva como " << outName << " (" << img.size() << " bytes)\n";
+        std::cout << "Capa salva como " << outName.u8string() << " (" << img.size() << " bytes)\n";
         if (debug) {
             const bool looksJpg = (img.size() >= 2 && img[0] == 0xFF && img[1] == 0xD8);
             const bool endsJpg = (img.size() >= 2 && img[img.size() - 2] == 0xFF && img[img.size() - 1] == 0xD9);
@@ -563,6 +565,44 @@ static int extractCoverFromMp3(const std::string &mp3PathRaw, const std::string 
     return 1;
 }
 
+#ifdef _WIN32
+
+int wmain(int argc, wchar_t *argv[])
+{
+    _setmode(_fileno(stdin), _O_U16TEXT);
+    _setmode(_fileno(stdout), _O_U16TEXT);
+
+    bool debug = false;
+    int argi = 1;
+    if (argc >= 2 && std::wstring(argv[1]) == L"--debug") {
+        debug = true;
+        argi = 2;
+    }
+
+    // Modo interativo: quando nao veio mp3 nos argumentos.
+    // Ex: Run normal sem args OU Run com "--debug".
+    if (argc <= argi) {
+        std::wstring mp3;
+        std::wstring out;
+        std::wcout << L"Cole o caminho do MP3 e aperte Enter:\n> ";
+        std::getline(std::wcin, mp3);
+        if (mp3.empty()) {
+            std::wcout << L"Uso: thumb_extrac [--debug] arquivo.mp3 [saida]\n";
+            return 1;
+        }
+
+        std::wcout << L"Saida (Enter para padrao):\n> ";
+        std::getline(std::wcin, out);
+        return extractCoverFromMp3(cleanPath(mp3), cleanPath(out), debug);
+    }
+
+    const fs::path mp3Path = cleanPath(argv[argi]);
+    const fs::path outArg = (argc >= argi + 2) ? cleanPath(argv[argi + 1]) : fs::path();
+    return extractCoverFromMp3(mp3Path, outArg, debug);
+}
+
+#else
+
 int main(int argc, char *argv[])
 {
     bool debug = false;
@@ -573,7 +613,7 @@ int main(int argc, char *argv[])
     }
 
     // Modo interativo: quando nao veio mp3 nos argumentos.
-    // Ex: Run normal (sem args) OU Run com "--debug".
+    // Ex: Run normal sem args OU Run com "--debug".
     if (argc <= argi) {
         std::string mp3;
         std::string out;
@@ -586,10 +626,12 @@ int main(int argc, char *argv[])
 
         std::cout << "Saida (Enter para padrao):\n> ";
         std::getline(std::cin, out);
-        return extractCoverFromMp3(mp3, out, debug);
+        return extractCoverFromMp3(cleanPath(mp3), cleanPath(out), debug);
     }
 
-    const std::string mp3Path = argv[argi];
-    const std::string outArg = (argc >= argi + 2) ? argv[argi + 1] : std::string();
+    const fs::path mp3Path = cleanPath(argv[argi]);
+    const fs::path outArg = (argc >= argi + 2) ? cleanPath(argv[argi + 1]) : fs::path();
     return extractCoverFromMp3(mp3Path, outArg, debug);
 }
+
+#endif

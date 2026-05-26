@@ -2,6 +2,11 @@
 /bin/
 /obj/
 
+# Common compiler outputs (may appear in project root)
+*.exe
+*.o
+*.obj
+
 # Code::Blocks user/layout files
 *.layout
 *.depend
@@ -9,6 +14,7 @@
 # Windows cruft
 Thumbs.db
 Desktop.ini
+main_unicode_fixed.cpp
 
 # Optional local artifacts
 *.jpg
