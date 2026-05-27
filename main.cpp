@@ -79,6 +79,15 @@ struct OutputOptions {
     bool overwrite = false;       // false = never overwrite
 };
 
+struct Id3Header {
+    uint8_t verMajor = 0;
+    uint8_t verRev = 0;
+    uint8_t flags = 0;
+    uint32_t tagSize = 0;
+    bool unsync = false;
+    bool hasExtendedHeader = false;
+};
+
 static NativeString applyStemPattern(const NativeString &pattern, const fs::path &mp3Path)
 {
     NativeString out = pattern;
@@ -267,6 +276,348 @@ static std::string extFromMimeOrFmt(const std::string &mimeOrFmt)
     return ".bin";
 }
 
+static void debugPrintLine(bool debug, const std::string &msg)
+{
+    if (!debug) return;
+    nout() << toNativeSimple(msg) << toNativeSimple("\n");
+}
+
+static void debugPrintId3Header(bool debug, const Id3Header &header)
+{
+    if (!debug) return;
+    nout() << toNativeSimple("[debug] ID3v2: 2.") << int(header.verMajor) << toNativeSimple(".") << int(header.verRev)
+           << toNativeSimple(" flags=0x") << std::hex << int(header.flags) << std::dec << toNativeSimple(" tagSize=")
+           << header.tagSize << toNativeSimple("\n");
+}
+
+static void debugPrintExtHeader(bool debug, uint32_t extSizeField, size_t candA, bool okA, size_t candB, bool okB, size_t chosen)
+{
+    if (!debug) return;
+    nout() << toNativeSimple("[debug] extHeader sizeField=") << extSizeField << toNativeSimple(" candA=") << candA
+           << toNativeSimple(" okA=") << (okA ? 1 : 0) << toNativeSimple(" candB=") << candB << toNativeSimple(" okB=")
+           << (okB ? 1 : 0) << toNativeSimple(" chosen=") << chosen << toNativeSimple("\n");
+}
+
+static void debugPrintFrameHeader(bool debug, const std::string &id, uint32_t frameSize, size_t hdrPos, size_t payloadPos, size_t nextPos,
+                                  uint8_t flagStatus, uint8_t flagFormat)
+{
+    if (!debug) return;
+    nout() << toNativeSimple("[frame] id=") << toNativeSimple(id) << toNativeSimple(" size=") << frameSize << toNativeSimple(" hdrPos=")
+           << hdrPos << toNativeSimple(" payloadPos=") << payloadPos << toNativeSimple(" nextPos=") << nextPos
+           << toNativeSimple(" status=0x") << std::hex << int(flagStatus) << toNativeSimple(" format=0x") << int(flagFormat)
+           << std::dec << toNativeSimple("\n");
+}
+
+static bool readId3Header(std::ifstream &in, Id3Header &header, bool debug)
+{
+    uint8_t raw[10];
+    in.read(reinterpret_cast<char *>(raw), 10);
+    if (in.gcount() != 10 || raw[0] != 'I' || raw[1] != 'D' || raw[2] != '3') {
+        nout() << toNativeSimple("Sem ID3v2 no inicio do arquivo") << toNativeSimple("\n");
+        return false;
+    }
+
+    header.verMajor = raw[3];
+    header.verRev = raw[4];
+    header.flags = raw[5];
+    header.tagSize = readSynchSafe32(&raw[6]);
+    header.unsync = (header.flags & 0x80) != 0;
+    header.hasExtendedHeader = (header.flags & 0x40) != 0;
+
+    debugPrintId3Header(debug, header);
+    return true;
+}
+
+static fs::path buildOutputPath(const fs::path &mp3Path, const OutputOptions &opt, const std::string &ext)
+{
+    const NativeString pattern = opt.namePattern.empty() ? toNativeSimple("{stem}") : opt.namePattern;
+    const NativeString baseName = applyStemPattern(pattern, mp3Path);
+
+    // Exact file path (user-specified, has extension)
+    if (!opt.out.empty() && opt.out.has_extension() && !isLikelyDirectoryPath(opt.out)) {
+        return opt.out;
+    }
+
+    // Folder destination
+    if (opt.out.empty()) {
+        return mp3Path.parent_path() / appendAsciiToPath(fs::path(baseName), ext);
+    }
+
+    if (isLikelyDirectoryPath(opt.out)) {
+        return opt.out / appendAsciiToPath(fs::path(baseName), ext);
+    }
+
+    // Back-compat: treat as base path/name.
+    return appendAsciiToPath(opt.out, ext);
+}
+
+static int writeCoverImage(const fs::path &mp3Path, const OutputOptions &opt, const std::vector<uint8_t> &img, const std::string &mimeOrFmt,
+                           bool debug)
+{
+    // Se o MIME/format estiver estranho, tenta detectar pelo "magic" real.
+    const std::string extByMime = extFromMimeOrFmt(mimeOrFmt);
+    fs::path outName = buildOutputPath(mp3Path, opt, extByMime);
+    const std::string magicExt = detectExtFromMagic(img);
+
+    const bool exactFile = (!opt.out.empty() && opt.out.has_extension() && !isLikelyDirectoryPath(opt.out));
+
+    // So ajusta a extensao automaticamente se o usuario nao passou um arquivo com extensao.
+    if (!magicExt.empty() && !exactFile) {
+        outName = buildOutputPath(mp3Path, opt, magicExt);
+    }
+
+    // Overwrite protection
+    {
+        std::error_code ec;
+        if (fs::exists(outName, ec) && !opt.overwrite) {
+            nout() << toNativeSimple("Output file already exists (won't overwrite): ") << outName.native() << toNativeSimple("\n");
+            nout() << toNativeSimple("Tip: use --overwrite or pick a different name.") << toNativeSimple("\n");
+            return 2; // skipped
+        }
+    }
+
+    std::ofstream out(outName, std::ios::binary);
+    if (!out) {
+        nout() << toNativeSimple("Nao foi possivel criar o arquivo de saida") << toNativeSimple("\n");
+        return 1;
+    }
+
+    out.write(reinterpret_cast<const char *>(img.data()), img.size());
+    out.close();
+
+    nout() << toNativeSimple("Capa salva como ") << outName.native() << toNativeSimple(" (") << img.size() << toNativeSimple(" bytes)\n");
+    if (debug) {
+        const bool looksJpg = (img.size() >= 2 && img[0] == 0xFF && img[1] == 0xD8);
+        const bool endsJpg = (img.size() >= 2 && img[img.size() - 2] == 0xFF && img[img.size() - 1] == 0xD9);
+        const bool looksPng = (img.size() >= 8 && img[0] == 0x89 && img[1] == 0x50 && img[2] == 0x4E && img[3] == 0x47);
+
+        nout() << toNativeSimple("[debug] mime/fmt='") << toNativeSimple(mimeOrFmt) << toNativeSimple("' magicExt='")
+               << toNativeSimple(magicExt.empty() ? "?" : magicExt) << toNativeSimple("' firstBytes=")
+               << toNativeSimple(hexPrefix(img, 16)) << toNativeSimple("\n");
+        nout() << toNativeSimple("[debug] lastBytes=") << toNativeSimple(hexSuffix(img, 16)) << toNativeSimple("\n");
+        nout() << toNativeSimple("[debug] looksJpg=") << (looksJpg ? 1 : 0) << toNativeSimple(" endsJpg=") << (endsJpg ? 1 : 0)
+               << toNativeSimple(" looksPng=") << (looksPng ? 1 : 0) << toNativeSimple("\n");
+    }
+    return 0;
+}
+
+static bool isMagicKnown(const std::vector<uint8_t> &img)
+{
+    return !detectExtFromMagic(img).empty();
+}
+
+static bool chooseBetter(const ApicCandidate &a, const ApicCandidate &b)
+{
+    // true se a melhor que b
+    if (a.magicKnown != b.magicKnown) return a.magicKnown; // prefira magic conhecido
+    if (a.img.size() != b.img.size()) return a.img.size() > b.img.size();
+    return a.storedPayloadBytes > b.storedPayloadBytes;
+}
+
+static void updateBest(ApicCandidate &best, bool &hasBest, ApicCandidate &&cand)
+{
+    if (cand.img.empty()) return;
+    if (!hasBest || chooseBetter(cand, best)) {
+        best = std::move(cand);
+        hasBest = true;
+    }
+}
+
+static ApicCandidate parseApicPayload(const std::vector<uint8_t> &payloadIn, bool v24Local, bool headerUnsync, uint8_t flagFormatLocal,
+                                      uint8_t flagStatusLocal, size_t storedPayloadBytes, bool debug)
+{
+    std::vector<uint8_t> payload = payloadIn;
+
+    // Unsync: em v2.3 pode vir no header e vale para todos frames. Em v2.4 pode vir por-frame.
+    const bool tagUnsync = headerUnsync;
+    const bool frameUnsync = v24Local && ((flagFormatLocal & 0x02) != 0);
+    if (tagUnsync || frameUnsync) {
+        payload = unsyncDecode(payload);
+    }
+
+    size_t payloadPos = 0;
+
+    // grouping identity: 1 byte no inicio do frame
+    if (v24Local) {
+        if ((flagFormatLocal & 0x40) != 0) payloadPos += 1;
+    } else {
+        if ((flagFormatLocal & 0x20) != 0) payloadPos += 1;
+    }
+
+    // v2.4: data length indicator
+    if (v24Local && ((flagFormatLocal & 0x01) != 0)) {
+        if (payload.size() < payloadPos + 4) return {};
+        payloadPos += 4;
+    }
+
+    // Rejeita compressao/criptografia
+    if (v24Local) {
+        const bool compressed = (flagFormatLocal & 0x08) != 0;
+        const bool encrypted = (flagFormatLocal & 0x04) != 0;
+        if (compressed || encrypted) {
+            if (debug) {
+                nout() << toNativeSimple("[debug] APIC compressed/encrypted v2.4 status=0x") << std::hex << int(flagStatusLocal)
+                       << toNativeSimple(" format=0x") << int(flagFormatLocal) << std::dec << toNativeSimple("\n");
+            }
+            return {};
+        }
+    } else {
+        const bool compressed = (flagFormatLocal & 0x80) != 0;
+        const bool encrypted = (flagFormatLocal & 0x40) != 0;
+        if (compressed || encrypted) {
+            if (debug) {
+                nout() << toNativeSimple("[debug] APIC compressed/encrypted v2.3 status=0x") << std::hex << int(flagStatusLocal)
+                       << toNativeSimple(" format=0x") << int(flagFormatLocal) << std::dec << toNativeSimple("\n");
+            }
+            return {};
+        }
+    }
+
+    size_t p = payloadPos;
+    if (p >= payload.size()) return {};
+
+    const uint8_t encoding = payload[p++];
+
+    std::string mime;
+    while (p < payload.size() && payload[p] != 0x00) {
+        mime.push_back(char(payload[p]));
+        ++p;
+    }
+    if (p >= payload.size()) return {};
+    ++p; // \0
+    if (p >= payload.size()) return {};
+
+    p += 1; // picture type
+
+    // descricao
+    if (encoding == 0 || encoding == 3) {
+        while (p < payload.size() && payload[p] != 0x00) ++p;
+        if (p < payload.size()) ++p;
+    } else {
+        while (p + 1 < payload.size()) {
+            if (payload[p] == 0x00 && payload[p + 1] == 0x00) {
+                p += 2;
+                break;
+            }
+            p += 2;
+        }
+    }
+    if (p >= payload.size()) return {};
+
+    ApicCandidate cand;
+    cand.mime = mime;
+    cand.storedPayloadBytes = storedPayloadBytes;
+    cand.img.assign(payload.begin() + p, payload.end());
+    cand.magicKnown = isMagicKnown(cand.img);
+
+    if (debug) {
+        nout() << toNativeSimple("[debug] APIC mime='") << toNativeSimple(mime) << toNativeSimple("' encoding=") << int(encoding)
+               << toNativeSimple(" storedPayloadBytes=") << storedPayloadBytes << toNativeSimple(" decodedPayloadBytes=") << payload.size()
+               << toNativeSimple(" imgBytes=") << cand.img.size() << toNativeSimple(" magicKnown=") << (cand.magicKnown ? 1 : 0)
+               << toNativeSimple("\n");
+    }
+
+    return cand;
+}
+
+static void scanPicFramesV22(const std::vector<uint8_t> &tag, size_t startPos, ApicCandidate &best, bool &hasBest)
+{
+    size_t pos = startPos;
+    while (pos + 6 <= tag.size()) {
+        if (tag[pos] == 0 && tag[pos + 1] == 0 && tag[pos + 2] == 0) break; // padding
+
+        const std::string id(reinterpret_cast<const char *>(&tag[pos]), 3);
+        const uint32_t size = (uint32_t(tag[pos + 3]) << 16) | (uint32_t(tag[pos + 4]) << 8) | uint32_t(tag[pos + 5]);
+        pos += 6;
+        if (size == 0 || pos + size > tag.size()) break;
+
+        if (id == "PIC" && size >= 5) {
+            size_t p = pos;
+            const uint8_t enc = tag[p++];
+
+            const std::string fmt(reinterpret_cast<const char *>(&tag[p]), 3);
+            p += 3;
+            p += 1; // picture type
+
+            // Descricao: terminador depende do encoding
+            if (enc == 0 || enc == 3) {
+                // ISO-8859-1 / UTF-8: termina em 0x00
+                while (p < pos + size && tag[p] != 0x00) ++p;
+                if (p < pos + size && tag[p] == 0x00) ++p;
+            } else {
+                // UTF-16 / UTF-16BE: termina em 0x00 0x00
+                while (p + 1 < pos + size) {
+                    if (tag[p] == 0x00 && tag[p + 1] == 0x00) {
+                        p += 2;
+                        break;
+                    }
+                    p += 2;
+                }
+            }
+
+            if (p < pos + size) {
+                ApicCandidate cand;
+                cand.mime = fmt;
+                cand.storedPayloadBytes = size;
+                cand.img.assign(tag.begin() + p, tag.begin() + (pos + size));
+                cand.magicKnown = isMagicKnown(cand.img);
+                updateBest(best, hasBest, std::move(cand));
+            }
+        }
+
+        pos += size;
+    }
+}
+
+static void scanApicFramesV23V24(const std::vector<uint8_t> &tag, size_t startPos, bool v24, bool headerUnsync, ApicCandidate &best,
+                                 bool &hasBest, bool debug)
+{
+    size_t ppos = startPos;
+    while (ppos + 10 <= tag.size()) {
+        if (tag[ppos] == 0 && tag[ppos + 1] == 0 && tag[ppos + 2] == 0 && tag[ppos + 3] == 0) break;
+
+        if (!looksLikeFrameIdV23V24(tag, ppos)) break;
+
+        const std::string id(reinterpret_cast<const char *>(&tag[ppos]), 4);
+        const uint32_t frameSize = v24 ? readSynchSafe32(&tag[ppos + 4]) : readU32BE(&tag[ppos + 4]);
+        const uint8_t flagStatus = tag[ppos + 8];
+        const uint8_t flagFormat = tag[ppos + 9];
+
+        const size_t payloadStart = ppos + 10;
+        const size_t nextPos = payloadStart + frameSize;
+        if (frameSize == 0 || nextPos > tag.size()) break;
+
+        debugPrintFrameHeader(debug, id, frameSize, ppos, payloadStart, nextPos, flagStatus, flagFormat);
+
+        if (id == "APIC") {
+            std::vector<uint8_t> payload(tag.begin() + payloadStart, tag.begin() + nextPos);
+            ApicCandidate cand = parseApicPayload(payload, v24, headerUnsync, flagFormat, flagStatus, frameSize, debug);
+            updateBest(best, hasBest, std::move(cand));
+        }
+
+        ppos = nextPos;
+    }
+
+    // Fallback: varredura bruta por "APIC" caso a tag esteja inconsistente.
+    if (!hasBest) {
+        debugPrintLine(debug, "[debug] fallback brute-scan for APIC");
+        for (size_t i = startPos; i + 10 <= tag.size(); ++i) {
+            if (tag[i] != 'A' || tag[i + 1] != 'P' || tag[i + 2] != 'I' || tag[i + 3] != 'C') continue;
+            // tenta interpretar como frame header
+            const uint32_t frameSize = v24 ? readSynchSafe32(&tag[i + 4]) : readU32BE(&tag[i + 4]);
+            const uint8_t flagStatus = tag[i + 8];
+            const uint8_t flagFormat = tag[i + 9];
+            const size_t payloadStart = i + 10;
+            const size_t nextPos = payloadStart + frameSize;
+            if (frameSize == 0 || nextPos > tag.size()) continue;
+
+            std::vector<uint8_t> payload(tag.begin() + payloadStart, tag.begin() + nextPos);
+            ApicCandidate cand = parseApicPayload(payload, v24, headerUnsync, flagFormat, flagStatus, frameSize, debug);
+            updateBest(best, hasBest, std::move(cand));
+        }
+    }
+}
+
 static int extractCoverFromMp3(const fs::path &mp3Path, const OutputOptions &opt, bool debug)
 {
     std::ifstream in(mp3Path, std::ios::binary);
@@ -275,31 +626,17 @@ static int extractCoverFromMp3(const fs::path &mp3Path, const OutputOptions &opt
         return 1;
     }
 
-    uint8_t header[10];
-    in.read(reinterpret_cast<char *>(header), 10);
-    if (in.gcount() != 10 || header[0] != 'I' || header[1] != 'D' || header[2] != '3') {
-        nout() << toNativeSimple("Sem ID3v2 no inicio do arquivo") << toNativeSimple("\n");
+    Id3Header header;
+    if (!readId3Header(in, header, debug)) {
         return 1;
     }
 
-    const uint8_t verMajor = header[3];
-    const uint8_t verRev = header[4];
-    const uint8_t flags = header[5];
-    const uint32_t tagSize = readSynchSafe32(&header[6]);
-
-    const bool headerUnsync = (flags & 0x80) != 0;
-
-    if (debug) {
-        nout() << toNativeSimple("[debug] ID3v2: 2.") << int(verMajor) << toNativeSimple(".") << int(verRev) << toNativeSimple(" flags=0x")
-               << std::hex << int(flags) << std::dec << toNativeSimple(" tagSize=") << tagSize << toNativeSimple("\n");
-    }
-
-    if (tagSize == 0) {
+    if (header.tagSize == 0) {
         nout() << toNativeSimple("ID3v2 vazio") << toNativeSimple("\n");
         return 1;
     }
 
-    std::vector<uint8_t> tag(tagSize);
+    std::vector<uint8_t> tag(header.tagSize);
     in.read(reinterpret_cast<char *>(tag.data()), tag.size());
     if (size_t(in.gcount()) != tag.size()) {
         nout() << toNativeSimple("Arquivo truncado") << toNativeSimple("\n");
@@ -309,19 +646,19 @@ static int extractCoverFromMp3(const fs::path &mp3Path, const OutputOptions &opt
     size_t pos = 0;
 
     // Pular extended header se existir
-    if (flags & 0x40) {
+    if (header.hasExtendedHeader) {
         if (tag.size() < 4) {
             nout() << toNativeSimple("ID3v2 com header estendido invalido") << toNativeSimple("\n");
             return 1;
         }
 
         uint32_t extSizeField = 0;
-        if (verMajor == 3) {
+        if (header.verMajor == 3) {
             extSizeField = readU32BE(&tag[pos]);
-        } else if (verMajor == 4) {
+        } else if (header.verMajor == 4) {
             extSizeField = readSynchSafe32(&tag[pos]);
         } else {
-            nout() << toNativeSimple("Versao ID3v2 nao suportada: 2.") << int(verMajor) << toNativeSimple("\n");
+            nout() << toNativeSimple("Versao ID3v2 nao suportada: 2.") << int(header.verMajor) << toNativeSimple("\n");
             return 1;
         }
 
@@ -345,320 +682,35 @@ static int extractCoverFromMp3(const fs::path &mp3Path, const OutputOptions &opt
             return 1;
         }
 
-        if (debug) {
-            nout() << toNativeSimple("[debug] extHeader sizeField=") << extSizeField << toNativeSimple(" candA=") << candA
-                   << toNativeSimple(" okA=") << (okA ? 1 : 0) << toNativeSimple(" candB=") << candB << toNativeSimple(" okB=")
-                   << (okB ? 1 : 0) << toNativeSimple(" chosen=") << chosen << toNativeSimple("\n");
-        }
+        debugPrintExtHeader(debug, extSizeField, candA, okA, candB, okB, chosen);
 
         pos = chosen;
     }
 
-    auto buildOutName = [&](const std::string &ext) -> fs::path {
-        const NativeString pattern = opt.namePattern.empty() ? toNativeSimple("{stem}") : opt.namePattern;
-        const NativeString baseName = applyStemPattern(pattern, mp3Path);
-
-        // Exact file path (user-specified, has extension)
-        if (!opt.out.empty() && opt.out.has_extension() && !isLikelyDirectoryPath(opt.out)) {
-            return opt.out;
-        }
-
-        // Folder destination
-        if (opt.out.empty()) {
-            return mp3Path.parent_path() / appendAsciiToPath(fs::path(baseName), ext);
-        }
-
-        if (isLikelyDirectoryPath(opt.out)) {
-            return opt.out / appendAsciiToPath(fs::path(baseName), ext);
-        }
-
-        // Back-compat: treat as base path/name.
-        return appendAsciiToPath(opt.out, ext);
-    };
-
-    auto writeCover = [&](const std::vector<uint8_t> &img, const std::string &mimeOrFmt) -> int {
-        // Se o MIME/format estiver estranho, tenta detectar pelo "magic" real.
-        const std::string extByMime = extFromMimeOrFmt(mimeOrFmt);
-        fs::path outName = buildOutName(extByMime);
-        const std::string magicExt = detectExtFromMagic(img);
-
-        const bool exactFile = (!opt.out.empty() && opt.out.has_extension() && !isLikelyDirectoryPath(opt.out));
-
-        // So ajusta a extensao automaticamente se o usuario nao passou um arquivo com extensao.
-        if (!magicExt.empty() && !exactFile) {
-            outName = buildOutName(magicExt);
-        }
-
-        // Overwrite protection
-        {
-            std::error_code ec;
-            if (fs::exists(outName, ec) && !opt.overwrite) {
-                nout() << toNativeSimple("Output file already exists (won't overwrite): ") << outName.native() << toNativeSimple("\n");
-                nout() << toNativeSimple("Tip: use --overwrite or pick a different name.") << toNativeSimple("\n");
-                return 2; // skipped
-            }
-        }
-
-        std::ofstream out(outName, std::ios::binary);
-        if (!out) {
-            nout() << toNativeSimple("Nao foi possivel criar o arquivo de saida") << toNativeSimple("\n");
-            return 1;
-        }
-
-        out.write(reinterpret_cast<const char *>(img.data()), img.size());
-        out.close();
-
-        nout() << toNativeSimple("Capa salva como ") << outName.native() << toNativeSimple(" (") << img.size() << toNativeSimple(" bytes)\n");
-        if (debug) {
-            const bool looksJpg = (img.size() >= 2 && img[0] == 0xFF && img[1] == 0xD8);
-            const bool endsJpg = (img.size() >= 2 && img[img.size() - 2] == 0xFF && img[img.size() - 1] == 0xD9);
-            const bool looksPng = (img.size() >= 8 && img[0] == 0x89 && img[1] == 0x50 && img[2] == 0x4E && img[3] == 0x47);
-
-            nout() << toNativeSimple("[debug] mime/fmt='") << toNativeSimple(mimeOrFmt) << toNativeSimple("' magicExt='")
-                   << toNativeSimple(magicExt.empty() ? "?" : magicExt) << toNativeSimple("' firstBytes=")
-                   << toNativeSimple(hexPrefix(img, 16)) << toNativeSimple("\n");
-            nout() << toNativeSimple("[debug] lastBytes=") << toNativeSimple(hexSuffix(img, 16)) << toNativeSimple("\n");
-            nout() << toNativeSimple("[debug] looksJpg=") << (looksJpg ? 1 : 0) << toNativeSimple(" endsJpg=") << (endsJpg ? 1 : 0)
-                   << toNativeSimple(" looksPng=") << (looksPng ? 1 : 0) << toNativeSimple("\n");
-        }
-        return 0;
-    };
-
-    auto isMagicKnown = [&](const std::vector<uint8_t> &img) -> bool {
-        return !detectExtFromMagic(img).empty();
-    };
-
-    auto chooseBetter = [&](const ApicCandidate &a, const ApicCandidate &b) -> bool {
-        // true se a melhor que b
-        if (a.magicKnown != b.magicKnown) return a.magicKnown; // prefira magic conhecido
-        if (a.img.size() != b.img.size()) return a.img.size() > b.img.size();
-        return a.storedPayloadBytes > b.storedPayloadBytes;
-    };
-
-    auto updateBest = [&](ApicCandidate &best, bool &hasBest, ApicCandidate &&cand) {
-        if (cand.img.empty()) return;
-        if (!hasBest || chooseBetter(cand, best)) {
-            best = std::move(cand);
-            hasBest = true;
-        }
-    };
-
-    auto parseApicPayload = [&](const std::vector<uint8_t> &payloadIn, bool v24Local, uint8_t flagFormatLocal, uint8_t flagStatusLocal,
-                                size_t storedPayloadBytes) -> ApicCandidate {
-        std::vector<uint8_t> payload = payloadIn;
-
-        // Unsync: em v2.3 pode vir no header e vale para todos frames. Em v2.4 pode vir por-frame.
-        const bool tagUnsync = headerUnsync;
-        const bool frameUnsync = v24Local && ((flagFormatLocal & 0x02) != 0);
-        if (tagUnsync || frameUnsync) {
-            payload = unsyncDecode(payload);
-        }
-
-        size_t payloadPos = 0;
-
-        // grouping identity: 1 byte no inicio do frame
-        if (v24Local) {
-            if ((flagFormatLocal & 0x40) != 0) payloadPos += 1;
-        } else {
-            if ((flagFormatLocal & 0x20) != 0) payloadPos += 1;
-        }
-
-        // v2.4: data length indicator
-        if (v24Local && ((flagFormatLocal & 0x01) != 0)) {
-            if (payload.size() < payloadPos + 4) return {};
-            payloadPos += 4;
-        }
-
-        // Rejeita compressao/criptografia
-        if (v24Local) {
-            const bool compressed = (flagFormatLocal & 0x08) != 0;
-            const bool encrypted = (flagFormatLocal & 0x04) != 0;
-            if (compressed || encrypted) {
-                if (debug) {
-                    nout() << toNativeSimple("[debug] APIC compressed/encrypted v2.4 status=0x") << std::hex << int(flagStatusLocal)
-                           << toNativeSimple(" format=0x") << int(flagFormatLocal) << std::dec << toNativeSimple("\n");
-                }
-                return {};
-            }
-        } else {
-            const bool compressed = (flagFormatLocal & 0x80) != 0;
-            const bool encrypted = (flagFormatLocal & 0x40) != 0;
-            if (compressed || encrypted) {
-                if (debug) {
-                    nout() << toNativeSimple("[debug] APIC compressed/encrypted v2.3 status=0x") << std::hex << int(flagStatusLocal)
-                           << toNativeSimple(" format=0x") << int(flagFormatLocal) << std::dec << toNativeSimple("\n");
-                }
-                return {};
-            }
-        }
-
-        size_t p = payloadPos;
-        if (p >= payload.size()) return {};
-
-        const uint8_t encoding = payload[p++];
-
-        std::string mime;
-        while (p < payload.size() && payload[p] != 0x00) {
-            mime.push_back(char(payload[p]));
-            ++p;
-        }
-        if (p >= payload.size()) return {};
-        ++p; // \0
-        if (p >= payload.size()) return {};
-
-        p += 1; // picture type
-
-        // descricao
-        if (encoding == 0 || encoding == 3) {
-            while (p < payload.size() && payload[p] != 0x00) ++p;
-            if (p < payload.size()) ++p;
-        } else {
-            while (p + 1 < payload.size()) {
-                if (payload[p] == 0x00 && payload[p + 1] == 0x00) {
-                    p += 2;
-                    break;
-                }
-                p += 2;
-            }
-        }
-        if (p >= payload.size()) return {};
-
-        ApicCandidate cand;
-        cand.mime = mime;
-        cand.storedPayloadBytes = storedPayloadBytes;
-        cand.img.assign(payload.begin() + p, payload.end());
-        cand.magicKnown = isMagicKnown(cand.img);
-
-        if (debug) {
-            nout() << toNativeSimple("[debug] APIC mime='") << toNativeSimple(mime) << toNativeSimple("' encoding=") << int(encoding)
-                   << toNativeSimple(" storedPayloadBytes=") << storedPayloadBytes << toNativeSimple(" decodedPayloadBytes=") << payload.size()
-                   << toNativeSimple(" imgBytes=") << cand.img.size() << toNativeSimple(" magicKnown=") << (cand.magicKnown ? 1 : 0)
-                   << toNativeSimple("\n");
-        }
-
-        return cand;
-    };
-
     // Frames
-    if (verMajor == 2) {
-        // ID3v2.2: frames com 6 bytes de header
+    if (header.verMajor == 2) {
         ApicCandidate best;
         bool hasBest = false;
-        while (pos + 6 <= tag.size()) {
-            if (tag[pos] == 0 && tag[pos + 1] == 0 && tag[pos + 2] == 0) break; // padding
+        scanPicFramesV22(tag, pos, best, hasBest);
 
-            const std::string id(reinterpret_cast<const char *>(&tag[pos]), 3);
-            const uint32_t size = (uint32_t(tag[pos + 3]) << 16) | (uint32_t(tag[pos + 4]) << 8) | uint32_t(tag[pos + 5]);
-            pos += 6;
-            if (size == 0 || pos + size > tag.size()) break;
-
-            if (id == "PIC" && size >= 5) {
-                size_t p = pos;
-                const uint8_t enc = tag[p++];
-
-                const std::string fmt(reinterpret_cast<const char *>(&tag[p]), 3);
-                p += 3;
-                p += 1; // picture type
-
-                // Descricao: terminador depende do encoding
-                if (enc == 0 || enc == 3) {
-                    // ISO-8859-1 / UTF-8: termina em 0x00
-                    while (p < pos + size && tag[p] != 0x00) ++p;
-                    if (p < pos + size && tag[p] == 0x00) ++p;
-                } else {
-                    // UTF-16 / UTF-16BE: termina em 0x00 0x00
-                    while (p + 1 < pos + size) {
-                        if (tag[p] == 0x00 && tag[p + 1] == 0x00) {
-                            p += 2;
-                            break;
-                        }
-                        p += 2;
-                    }
-                }
-
-                if (p < pos + size) {
-                    ApicCandidate cand;
-                    cand.mime = fmt;
-                    cand.storedPayloadBytes = size;
-                    cand.img.assign(tag.begin() + p, tag.begin() + (pos + size));
-                    cand.magicKnown = isMagicKnown(cand.img);
-                    updateBest(best, hasBest, std::move(cand));
-                }
-            }
-
-            pos += size;
-        }
-
-        if (hasBest) return writeCover(best.img, best.mime);
+        if (hasBest) return writeCoverImage(mp3Path, opt, best.img, best.mime, debug);
 
         nout() << toNativeSimple("Sem imagem embutida") << toNativeSimple("\n");
         return 1;
     }
 
-    if (verMajor != 3 && verMajor != 4) {
-        nout() << toNativeSimple("Versao ID3v2 nao suportada: 2.") << int(verMajor) << toNativeSimple("\n");
+    if (header.verMajor != 3 && header.verMajor != 4) {
+        nout() << toNativeSimple("Versao ID3v2 nao suportada: 2.") << int(header.verMajor) << toNativeSimple("\n");
         return 1;
     }
 
-    const bool v24 = (verMajor == 4);
+    const bool v24 = (header.verMajor == 4);
     ApicCandidate best;
     bool hasBest = false;
 
-    auto scanFrames = [&](size_t startPos) {
-        size_t ppos = startPos;
-        while (ppos + 10 <= tag.size()) {
-            if (tag[ppos] == 0 && tag[ppos + 1] == 0 && tag[ppos + 2] == 0 && tag[ppos + 3] == 0) break;
+    scanApicFramesV23V24(tag, pos, v24, header.unsync, best, hasBest, debug);
 
-            if (!looksLikeFrameIdV23V24(tag, ppos)) break;
-
-            const std::string id(reinterpret_cast<const char *>(&tag[ppos]), 4);
-            const uint32_t frameSize = v24 ? readSynchSafe32(&tag[ppos + 4]) : readU32BE(&tag[ppos + 4]);
-            const uint8_t flagStatus = tag[ppos + 8];
-            const uint8_t flagFormat = tag[ppos + 9];
-
-            const size_t payloadStart = ppos + 10;
-            const size_t nextPos = payloadStart + frameSize;
-            if (frameSize == 0 || nextPos > tag.size()) break;
-
-            if (debug) {
-                nout() << toNativeSimple("[frame] id=") << toNativeSimple(id) << toNativeSimple(" size=") << frameSize
-                       << toNativeSimple(" hdrPos=") << ppos << toNativeSimple(" payloadPos=") << payloadStart
-                       << toNativeSimple(" nextPos=") << nextPos << toNativeSimple(" status=0x") << std::hex << int(flagStatus)
-                       << toNativeSimple(" format=0x") << int(flagFormat) << std::dec << toNativeSimple("\n");
-            }
-
-            if (id == "APIC") {
-                std::vector<uint8_t> payload(tag.begin() + payloadStart, tag.begin() + nextPos);
-                ApicCandidate cand = parseApicPayload(payload, v24, flagFormat, flagStatus, frameSize);
-                updateBest(best, hasBest, std::move(cand));
-            }
-
-            ppos = nextPos;
-        }
-    };
-
-    scanFrames(pos);
-
-    // Fallback: varredura bruta por "APIC" caso a tag esteja inconsistente.
-    if (!hasBest) {
-        if (debug) nout() << toNativeSimple("[debug] fallback brute-scan for APIC\n");
-        for (size_t i = pos; i + 10 <= tag.size(); ++i) {
-            if (tag[i] != 'A' || tag[i + 1] != 'P' || tag[i + 2] != 'I' || tag[i + 3] != 'C') continue;
-            // tenta interpretar como frame header
-            const uint32_t frameSize = v24 ? readSynchSafe32(&tag[i + 4]) : readU32BE(&tag[i + 4]);
-            const uint8_t flagStatus = tag[i + 8];
-            const uint8_t flagFormat = tag[i + 9];
-            const size_t payloadStart = i + 10;
-            const size_t nextPos = payloadStart + frameSize;
-            if (frameSize == 0 || nextPos > tag.size()) continue;
-
-            std::vector<uint8_t> payload(tag.begin() + payloadStart, tag.begin() + nextPos);
-            ApicCandidate cand = parseApicPayload(payload, v24, flagFormat, flagStatus, frameSize);
-            updateBest(best, hasBest, std::move(cand));
-        }
-    }
-
-    if (hasBest) return writeCover(best.img, best.mime);
+    if (hasBest) return writeCoverImage(mp3Path, opt, best.img, best.mime, debug);
 
     nout() << toNativeSimple("Sem imagem embutida") << toNativeSimple("\n");
     return 1;

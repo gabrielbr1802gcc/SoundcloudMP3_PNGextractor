@@ -4,6 +4,28 @@ This is a small, dependency-free C++ tool that extracts the embedded cover art (
 
 Some MP3 downloads (for example, from SoundCloud/downloaders) store the cover inside the tag in a way that Windows/Android doesn’t always show clearly. This program pulls that image out and writes it as a normal image file.
 
+## Features
+
+- ID3v2.2 (`PIC`) and ID3v2.3/2.4 (`APIC`) cover extraction
+- Single-file and batch-folder modes (batch is non-recursive)
+- Output naming with `{stem}` patterns
+- Overwrite protection (interactive prompt or `--overwrite`)
+- Windows Unicode path support (wide argv + wide streams)
+- Magic-byte image detection (jpg/png/gif/webp/bmp)
+- Debug mode with tag/frame details and APIC fallback scan
+
+## Algorithm (high level)
+
+1. Read the ID3v2 header (version, flags, tag size).
+2. Read the tag body into memory.
+3. Skip the extended header if present.
+4. Scan frames:
+	- v2.2: `PIC`
+	- v2.3/v2.4: `APIC` (handles unsync; rejects compressed/encrypted frames)
+	- fallback brute scan for `APIC` in malformed tags
+5. Choose the best image candidate (prefer known magic; larger payload).
+6. Detect image extension from magic bytes and write output.
+
 ## Usage
 
 ### Interactive mode (menu)
